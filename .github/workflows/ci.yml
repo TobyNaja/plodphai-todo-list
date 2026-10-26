@@ -253,21 +253,30 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # ยังไม่มี ASG = ยังไม่เคยรัน Infra Setup ในบัญชีนี้ (ตั้งระบบครั้งแรก)
+      # image ถูก push เข้า ECR ไปแล้วใน job build จึงข้าม rollout แบบไม่แดง
+      # Infra Setup จะสร้าง ASG ที่ใช้ image นี้เอง ข้ามได้เฉพาะกรณีนี้กรณีเดียว:
+      # ถ้าเรียก AWS ไม่ได้ (secret หมดอายุ / ไม่มีสิทธิ์) คำสั่งจะล้มและ job แดงตามปกติ
       - name: Find the ASG
         id: find
         run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "account=$account" >> "$GITHUB_OUTPUT"
           asg=$(aws autoscaling describe-auto-scaling-groups \
             --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, 'prod-pai-env-asg')].AutoScalingGroupName | [0]" \
             --output text)
           if [ "$asg" = "None" ] || [ -z "$asg" ]; then
-            echo "::error::ยังไม่มี ASG — ต้องรัน Infra Setup ที่ repo prodpai_cloud ก่อนหนึ่งครั้ง"
-            exit 1
+            echo "::warning::ยังไม่มี ASG ในบัญชี $account จึงข้าม rollout image $TAG อยู่ใน ECR แล้ว ไปรัน Infra Setup ที่ repo prodpai_cloud ต่อได้เลย (ถ้ามี ASG อยู่แล้ว แปลว่า secret ของ repo นี้ชี้ผิดบัญชี)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "asg=$asg" >> "$GITHUB_OUTPUT"
 
       # ถ้า ASG ยังเปิด/ปิดเครื่องค้างอยู่ (rollout รอบก่อน, scaling, เปลี่ยนเครื่องที่ป่วย)
       # รอให้นิ่งก่อน ไม่งั้นการนับเครื่องเก่า/ใหม่ใน rollout.sh จะคลาดเคลื่อน
       - name: Wait for the ASG to settle
+        if: steps.find.outputs.skip == 'false'
         run: |
           asg="${{ steps.find.outputs.asg }}"
           for i in $(seq 1 40); do
@@ -287,6 +296,7 @@ jobs:
 
       # 1. เปลี่ยนป้ายประกาศให้เป็นเวอร์ชันที่เพิ่ง push ขึ้น ECR
       - name: Update the image tag in SSM
+        if: steps.find.outputs.skip == 'false'
         run: |
           aws ssm put-parameter \
             --name "$IMAGE_TAG_PARAM" \
@@ -298,11 +308,24 @@ jobs:
       # 2. ทยอยเปลี่ยนเครื่อง: เปิดเครื่องใหม่ (อ่าน tag ใหม่จาก SSM) ให้ healthy ก่อน
       #    แล้วค่อยปิดเครื่องเก่าทีละตัว ถ้าเครื่องใหม่ไม่ healthy จะหยุดโดยไม่แตะเครื่องเก่า
       - name: Roll the instances
+        if: steps.find.outputs.skip == 'false'
         run: bash .github/scripts/rollout.sh "${{ steps.find.outputs.asg }}"
 
       - name: Summary
         if: always()
         run: |
+          if [ "${{ steps.find.outputs.skip }}" = "true" ]; then
+            {
+              echo "### Rollout skipped: no ASG yet"
+              echo ""
+              echo "- Account: \`${{ steps.find.outputs.account }}\`"
+              echo "- Image in ECR: \`$TAG\` and \`latest\`"
+              echo ""
+              echo "ตั้งระบบครั้งแรก: ไปที่ repo \`prodpai_cloud\` → Actions → **Infra Setup** → \`image_tag\` = \`latest\`"
+              echo "ถ้าบัญชีนี้มี ASG อยู่แล้ว แปลว่า secret ของ repo นี้ชี้ผิดบัญชี"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           {
             echo "### Rollout"
             echo ""
