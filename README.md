@@ -2,8 +2,9 @@
 
 A small, self-contained task manager used as a **demo workload** for the
 Plod Phai Cloud DevSecOps pipeline. CI in this repository tests, scans, builds
-and pushes the image to ECR; the infrastructure that runs it is deployed from
-the separate `prodpai_cloud` repository (see [CI pipeline](#ci-pipeline)).
+and pushes the image to ECR, then rolls it into the running EC2 instances. The
+infrastructure itself (VPC, ALB, ASG, …) is created from the separate
+`prodpai_cloud` repository (see [CI pipeline](#ci-pipeline)).
 
 It is a static web app: HTML, CSS and vanilla JavaScript served by Nginx. It
 has no backend, no database, no external API calls, and loads nothing from a CDN.
@@ -46,7 +47,8 @@ plodphai-todo-list/
 ├── package.json          # test scripts only, no dependencies
 ├── .github/
 │   ├── config.env        # ECR_REPOSITORY, read by the CI workflow
-│   └── workflows/ci.yml  # test → security → build, scan and push to ECR
+│   ├── scripts/rollout.sh # rolling instance swap (copy of prodpai_cloud/scripts/rollout_asg.sh)
+│   └── workflows/ci.yml  # test/lint/security → build, scan, push to ECR → rollout
 └── tests/
     ├── core.test.js      # unit tests for js/core.js
     ├── static.test.js    # file/markup/security/Dockerfile checks
@@ -83,7 +85,9 @@ curl -i http://localhost:8081/health    # HTTP/1.1 200 OK ... "ok"
 ```
 
 The image also defines a Docker `HEALTHCHECK` that calls `/health`. For an
-AWS ALB target group, use path `/health`, success code `200`, and port `8080`.
+AWS ALB target group, use path `/health` and success code `200`. In
+`prodpai_cloud` the instances run `docker run -p 80:8080`, so the target group
+itself listens on port `80`.
 
 ## Run the tests
 
@@ -102,27 +106,64 @@ npm run test:e2e       # browser tests only
 ## CI pipeline
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`, and
-can also be started by hand. **There is no CD workflow here**: the `Deploy` and
-`Destroy` workflows live in the `prodpai_cloud` repository and are run by
-whoever owns the AWS account. This repository only produces an image.
+can also be started by hand. On `main` it goes all the way: test, scan, build,
+push the image to ECR, then roll that image into the running Auto Scaling group.
 
 | Job | What it does |
 |---|---|
 | `Test` | `npm test` on Node 22, with `timeout-minutes: 10` so a stuck browser can't hang the run for hours |
-| `Security checks` | Semgrep (`p/javascript`, `p/dockerfile`, `p/secrets`) and a Trivy filesystem scan (vuln, misconfig, secret — CRITICAL/HIGH fail the job) |
-| `Build, scan and push image` | `docker build` → smoke test `/health` and `/` against the running container → Trivy image scan → CycloneDX SBOM artifact → push to ECR |
+| `Dockerfile lint` | Hadolint on `Dockerfile` (fails on warnings). Trivy catches security misconfig; this catches quality issues |
+| `Security checks` | Gitleaks over the **full git history**, Semgrep (`p/javascript`, `p/dockerfile`, `p/secrets`) and a Trivy filesystem scan (vuln, misconfig, secret — CRITICAL/HIGH fail the job). Semgrep and Trivy results are also uploaded as SARIF to the repository's **Security** tab |
+| `Build, scan and push image` | Needs the three jobs above. `docker build` → smoke test `/health` and `/` against the running container → Trivy image scan → CycloneDX SBOM artifact → push to ECR |
+| `Roll the new image into the ASG` | `main` only. Writes the new tag to SSM and swaps the ASG instances one by one (see below) |
 
 The image that gets pushed is the exact one that was just built, smoke tested
 and scanned, never a rebuild. It is pushed under two tags: the commit SHA and
 `latest`. The target repository name comes from `ECR_REPOSITORY` in
 `.github/config.env`, and the region is `us-east-1` (`AWS_REGION` at the top of
-the workflow).
+the workflow). `ECR_REPOSITORY` must match `APP_ECR_REPOSITORY` in
+`.github/config.env` of `prodpai_cloud`.
 
-**Pull requests are tested and scanned but never push.** The three AWS steps
-all carry `if: github.event_name != 'pull_request'`, so nothing from a PR can
-reach the registry. Note that this also means a **manual run (`workflow_dispatch`)
-from any branch does push**, and will move `latest` onto that branch's build —
-run it from `main` unless that is what you want.
+**Pull requests are tested and scanned but never push.** The AWS steps of the
+build job carry `if: github.event_name != 'pull_request'`, so nothing from a PR
+can reach the registry. Note that a **manual run (`workflow_dispatch`) from any
+branch does push**, and will move `latest` onto that branch's build. The rollout
+job, however, runs only for `refs/heads/main`, so a manual run from another
+branch never changes what production serves.
+
+### Rollout
+
+The rollout changes only *which image the instances run*. It does not create or
+delete any resource, does not touch Terraform and does not create launch
+template versions. It does two things:
+
+1. `aws ssm put-parameter --name /prod-pai/app/image_tag --value <commit SHA> --overwrite`
+2. `bash .github/scripts/rollout.sh <asg>`
+
+Instances read the tag from that SSM parameter when they boot and `docker pull`
+it from ECR. `rollout.sh` does a rolling replacement by hand (AWS Academy denies
+`autoscaling:StartInstanceRefresh`): it raises desired capacity by one, waits
+for the new instance to be healthy in the target group, then terminates the old
+instances one at a time, waiting for each replacement. If a new instance is not
+healthy in time (45 × 20 s by default) it stops without touching the remaining
+old instances, so the site stays on the previous version.
+
+Before rolling, the job waits for the ASG to settle (all instances
+`InService`), and a `prodpai-rollout` concurrency group keeps two rollouts from
+overlapping when pushes land back to back.
+
+`rollout.sh` is a copy of `scripts/rollout_asg.sh` in `prodpai_cloud` (used by
+its `Launch Image` workflow for rollbacks). Change both together.
+
+**First setup.** If the account has no ASG yet (`Infra Setup` in
+`prodpai_cloud` has never run), the rollout job shows a warning and skips
+itself — the image is already in ECR. Then run `prodpai_cloud` → Actions →
+**Infra Setup** with `image_tag=latest`. Every push after that rolls out on its
+own. If the warning appears although the ASG exists, this repository's secrets
+point at a different AWS account.
+
+**Rollback.** Use `prodpai_cloud` → Actions → **Launch Image** with an older
+commit SHA. It runs the same two steps.
 
 ### Secrets
 
@@ -130,15 +171,18 @@ Settings → Secrets and variables → Actions:
 
 | Secret | Why |
 |---|---|
-| `AWS_ACCESS_KEY_ID` | ECR push credentials |
-| `AWS_SECRET_ACCESS_KEY` | ECR push credentials |
+| `AWS_ACCESS_KEY_ID` | ECR push and rollout credentials |
+| `AWS_SECRET_ACCESS_KEY` | ECR push and rollout credentials |
 | `AWS_SESSION_TOKEN` | AWS Academy sessions expire roughly every 4 hours, so all three need replacing that often |
 
-These credentials only need permission to push to the one ECR repository.
-Nothing in this repository touches infrastructure.
+They must belong to the same AWS account as `prodpai_cloud`. Besides pushing to
+ECR, they need `ssm:PutParameter` on `/prod-pai/app/image_tag` and the
+Auto Scaling / ELB calls `rollout.sh` uses (`DescribeAutoScalingGroups`,
+`SetDesiredCapacity`, `TerminateInstanceInAutoScalingGroup`,
+`DescribeTargetHealth`). The AWS Academy `LabRole` session has all of these.
 
-After a green run on `main`, the run's summary shows the full image reference
-that was pushed — hand that tag to whoever runs `Deploy` in `prodpai_cloud`.
+After a run on `main`, the summary shows the image reference that was pushed
+and the result of the rollout.
 
 ## Where data is stored
 
